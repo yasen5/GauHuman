@@ -53,6 +53,7 @@ class CameraInfo(NamedTuple):
     big_pose_smpl_param: dict
     big_pose_world_vertex: np.array
     big_pose_world_bound: np.array
+    valid_mask: np.array = None  # region to supervise (e.g. skin+bg, excluding clothing); None = supervise everything
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -992,6 +993,188 @@ def readDNARenderingInfo(path, white_background, output_path, eval):
                            ply_path=ply_path)
     return scene_info
 
+##################################   ChestVid   ##################################
+# New reader (not part of upstream GauHuman) for the dermatology chestvid
+# capture, reusing data already prepared in GaussianAvatar's own layout:
+# <path>/{train,test}/{images,masks,cam_parms/<frame>.npz,smpl_parms.pth}.
+# Unlike ZJU-MoCap/MonoCap/DNA-Rendering (multi-camera rigs subsampled to
+# look monocular), this is genuinely single-camera: one image = one camera
+# pose = one body pose, all covarying together, which is the literal
+# "monocular human video" case GauHuman targets. Styled closely on
+# readCamerasDNARendering just above, since that's the only other reader in
+# this file already using SMPL-X.
+def readCamerasChestVid(path, white_background, split='train'):
+    cam_infos = []
+
+    data_folder = os.path.join(path, split)
+    frame_ids = sorted(f.split('.')[0] for f in os.listdir(os.path.join(data_folder, 'images')))
+
+    smpl_data = torch.load(os.path.join(data_folder, 'smpl_parms.pth'))
+    betas = smpl_data['beta'].numpy().reshape(-1).astype(np.float32)  # (10,)
+
+    gender = 'neutral'
+    smpl_model = SMPLX('assets/models/smplx/', smpl_type='smplx',
+                        gender=gender, use_face_contour=True, flat_hand_mean=True, use_pca=False,
+                        num_pca_comps=45, num_betas=10, num_expression_coeffs=10, ext='npz')
+
+    # SMPL-X in canonical (big) pose space -- same bend angles used for the
+    # other SMPL-X reader (readCamerasDNARendering) in this file.
+    big_pose_smpl_param = {}
+    big_pose_smpl_param['R'] = np.eye(3).astype(np.float32)
+    big_pose_smpl_param['Th'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['global_orient'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['betas'] = betas.reshape(1, 10)
+    big_pose_smpl_param['body_pose'] = np.zeros((1, 63)).astype(np.float32)
+    big_pose_smpl_param['jaw_pose'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['left_hand_pose'] = np.zeros((1, 45)).astype(np.float32)
+    big_pose_smpl_param['right_hand_pose'] = np.zeros((1, 45)).astype(np.float32)
+    big_pose_smpl_param['leye_pose'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['reye_pose'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['expression'] = np.zeros((1, 10)).astype(np.float32)
+    big_pose_smpl_param['transl'] = np.zeros((1, 3)).astype(np.float32)
+    big_pose_smpl_param['body_pose'][0, 2] = 45 / 180 * np.pi
+    big_pose_smpl_param['body_pose'][0, 5] = -45 / 180 * np.pi
+    big_pose_smpl_param['body_pose'][0, 20] = -30 / 180 * np.pi
+    big_pose_smpl_param['body_pose'][0, 23] = 30 / 180 * np.pi
+
+    big_pose_smpl_param_tensor = {k: torch.from_numpy(v) for k, v in big_pose_smpl_param.items()
+                                   if k not in ('R', 'Th')}
+    body_model_output = smpl_model(
+        global_orient=big_pose_smpl_param_tensor['global_orient'],
+        betas=big_pose_smpl_param_tensor['betas'],
+        body_pose=big_pose_smpl_param_tensor['body_pose'],
+        jaw_pose=big_pose_smpl_param_tensor['jaw_pose'],
+        left_hand_pose=big_pose_smpl_param_tensor['left_hand_pose'],
+        right_hand_pose=big_pose_smpl_param_tensor['right_hand_pose'],
+        leye_pose=big_pose_smpl_param_tensor['leye_pose'],
+        reye_pose=big_pose_smpl_param_tensor['reye_pose'],
+        expression=big_pose_smpl_param_tensor['expression'],
+        transl=big_pose_smpl_param_tensor['transl'],
+        return_full_pose=True,
+    )
+    big_pose_smpl_param['poses'] = body_model_output.full_pose.detach()
+    big_pose_smpl_param['shapes'] = np.concatenate([big_pose_smpl_param['betas'], big_pose_smpl_param['expression']], axis=-1)
+    big_pose_xyz = np.array(body_model_output.vertices.detach()).reshape(-1, 3).astype(np.float32)
+
+    big_pose_min_xyz = np.min(big_pose_xyz, axis=0) - 0.05
+    big_pose_max_xyz = np.max(big_pose_xyz, axis=0) + 0.05
+    big_pose_world_bound = np.stack([big_pose_min_xyz, big_pose_max_xyz], axis=0)
+
+    for idx, frame_id in enumerate(frame_ids):
+        image_path = os.path.join(data_folder, 'images', frame_id + '.png')
+        mask_path = os.path.join(data_folder, 'masks', frame_id + '.png')
+        cam_npz = np.load(os.path.join(data_folder, 'cam_parms', frame_id + '.npz'))
+        K = np.array(cam_npz['intrinsic'], np.float32).reshape(3, 3)
+        extr = np.array(cam_npz['extrinsic'], np.float32)
+        if extr.shape[0] == 3:
+            extr = np.vstack([extr, [0.0, 0.0, 0.0, 1.0]])
+
+        image = np.array(imageio.imread(image_path)).astype(np.float32) / 255.
+        msk = np.array(imageio.imread(mask_path)).astype(np.float32) / 255.
+        if msk.ndim == 3:
+            msk = msk[..., 0]
+        image[msk == 0] = 1 if white_background else 0
+
+        # cam_parms' extrinsic is identity (camera space == world space, per
+        # convert_chestvid_pear.py / derm_gs_train.py's own PEAR convention),
+        # so c2w == extr here; kept as an explicit inverse for clarity and in
+        # case a non-identity extrinsic is ever fed through this reader.
+        c2w = extr
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3, :3])
+        T = w2c[:3, 3]
+
+        image = Image.fromarray(np.array(image * 255.0, dtype=np.uint8), "RGB")
+        FovX = focal2fov(K[0, 0], image.size[0])
+        FovY = focal2fov(K[1, 1], image.size[1])
+
+        # smpl_parms.pth body_pose layout (see convert_chestvid_pear.py's
+        # build_pose_165): root(3) body(63) jaw(3) leye(3) reye(3) lhand(45) rhand(45)
+        pose_row = smpl_data['body_pose'][idx].numpy()
+        transl_row = smpl_data['trans'][idx].numpy().astype(np.float32)
+
+        smpl_param = {
+            'global_orient': pose_row[0:3].reshape(1, 3).astype(np.float32),
+            'body_pose': pose_row[3:66].reshape(1, 63).astype(np.float32),
+            'jaw_pose': pose_row[66:69].reshape(1, 3).astype(np.float32),
+            'leye_pose': pose_row[69:72].reshape(1, 3).astype(np.float32),
+            'reye_pose': pose_row[72:75].reshape(1, 3).astype(np.float32),
+            'left_hand_pose': pose_row[75:120].reshape(1, 45).astype(np.float32),
+            'right_hand_pose': pose_row[120:165].reshape(1, 45).astype(np.float32),
+            'betas': betas.reshape(1, 10),
+            'expression': np.zeros((1, 10), np.float32),
+            'transl': transl_row.reshape(1, 3),
+        }
+        smpl_param['R'] = np.eye(3).astype(np.float32)
+        smpl_param['Th'] = smpl_param['transl'].astype(np.float32)
+
+        smpl_param_tensor = {k: torch.from_numpy(v) for k, v in smpl_param.items() if k not in ('R', 'Th')}
+        body_model_output = smpl_model(
+            global_orient=smpl_param_tensor['global_orient'],
+            betas=smpl_param_tensor['betas'],
+            body_pose=smpl_param_tensor['body_pose'],
+            jaw_pose=smpl_param_tensor['jaw_pose'],
+            left_hand_pose=smpl_param_tensor['left_hand_pose'],
+            right_hand_pose=smpl_param_tensor['right_hand_pose'],
+            leye_pose=smpl_param_tensor['leye_pose'],
+            reye_pose=smpl_param_tensor['reye_pose'],
+            expression=smpl_param_tensor['expression'],
+            transl=smpl_param_tensor['transl'],
+            return_full_pose=True,
+        )
+        smpl_param['poses'] = body_model_output.full_pose.detach()
+        smpl_param['shapes'] = np.concatenate([smpl_param['betas'], smpl_param['expression']], axis=-1)
+
+        xyz = np.array(body_model_output.vertices.detach()).reshape(-1, 3).astype(np.float32)
+        min_xyz = np.min(xyz, axis=0) - 0.05
+        max_xyz = np.max(xyz, axis=0) + 0.05
+        world_bound = np.stack([min_xyz, max_xyz], axis=0)
+
+        bound_mask = get_bound_2d_mask(world_bound, K, w2c[:3], image.size[1], image.size[0])
+        bound_mask = Image.fromarray(np.array(bound_mask * 255.0, dtype=np.uint8))
+        bkgd_mask = Image.fromarray(np.array(msk * 255.0, dtype=np.uint8))
+
+        cam_infos.append(CameraInfo(uid=idx, pose_id=idx, R=R, T=T, K=K, FovY=FovY, FovX=FovX, image=image,
+                        image_path=image_path, image_name=frame_id, bkgd_mask=bkgd_mask,
+                        bound_mask=bound_mask, width=image.size[0], height=image.size[1],
+                        smpl_param=smpl_param, world_vertex=xyz, world_bound=world_bound,
+                        big_pose_smpl_param=big_pose_smpl_param, big_pose_world_vertex=big_pose_xyz,
+                        big_pose_world_bound=big_pose_world_bound))
+
+    return cam_infos
+
+
+def readChestVidInfo(path, white_background, output_path, eval):
+    print("Reading Training Transforms")
+    train_cam_infos = readCamerasChestVid(path, white_background, split='train')
+    print("Reading Test Transforms")
+    test_cam_infos = readCamerasChestVid(path, white_background, split='test')
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+    nerf_normalization['radius'] = 1
+
+    ply_path = os.path.join('output', output_path, "points3d.ply")
+    if not os.path.exists(ply_path):
+        num_pts = 10475
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = train_cam_infos[0].big_pose_world_vertex
+        shs = np.random.random((num_pts, 3)) / 255.0
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
 
 def prepare_smpl_params(smpl_path, pose_index):
     params_ori = dict(np.load(smpl_path, allow_pickle=True))['smpl'].item()
@@ -1058,4 +1241,5 @@ sceneLoadTypeCallbacks = {
     "ZJU_MoCap_refine" : readZJUMoCapRefineInfo,
     "MonoCap": readMonoCapdataInfo,
     "dna_rendering": readDNARenderingInfo,
+    "ChestVid": readChestVidInfo,
 }

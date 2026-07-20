@@ -17,7 +17,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProject
 class Camera(nn.Module):
     def __init__(self, colmap_id, pose_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 bkgd_mask=None, bound_mask=None, smpl_param=None, 
+                 bkgd_mask=None, bound_mask=None, valid_mask=None, smpl_param=None,
                  world_vertex=None, world_bound=None, big_pose_smpl_param=None,
                  big_pose_world_vertex=None, big_pose_world_bound=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
@@ -35,6 +35,7 @@ class Camera(nn.Module):
         self.image_name = image_name
         self.bkgd_mask = bkgd_mask
         self.bound_mask = bound_mask
+        self.valid_mask = valid_mask
 
         try:
             self.data_device = torch.device(data_device)
